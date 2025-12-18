@@ -1,15 +1,15 @@
 /*
  * IP Forward - Game Server Proxy
- * Version: 1.2
+ * Version: 1.3
  *
  * Features:
- *   - Multi-player support
+ *   - Multiple forward rules support
+ *   - Multi-player support per forward
  *   - UDP/TCP forwarding
  *   - Dynamic DNS resolution (hourly refresh)
  *   - Existing sessions not disconnected on IP change
- *   - Daemon mode with proper daemonization
- *   - File logging with rotation support
- *   - Memory leak fixes
+ *   - Daemon mode
+ *   - File logging
  */
 
 #include <iostream>
@@ -32,7 +32,6 @@
 #include <queue>
 #include <functional>
 
-// Linux headers
 #include <sys/socket.h>
 #include <sys/select.h>
 #include <sys/stat.h>
@@ -46,7 +45,7 @@
 #include <errno.h>
 #include <limits.h>
 
-#define VERSION "1.2"
+#define VERSION "1.3"
 
 // ==================== Log Level ====================
 enum LogLevel
@@ -59,38 +58,27 @@ enum LogLevel
 
 // ==================== Global Variables ====================
 std::atomic<bool> g_running(true);
-std::atomic<int> g_udp_sessions(0);
-std::atomic<int> g_tcp_connections(0);
-std::atomic<uint64_t> g_packets_in(0);
-std::atomic<uint64_t> g_packets_out(0);
-std::atomic<uint64_t> g_bytes_in(0);
-std::atomic<uint64_t> g_bytes_out(0);
+std::atomic<uint64_t> g_total_packets_in(0);
+std::atomic<uint64_t> g_total_packets_out(0);
+std::atomic<uint64_t> g_total_bytes_in(0);
+std::atomic<uint64_t> g_total_bytes_out(0);
 std::string g_working_dir;
 std::string g_exe_path;
 
-// ==================== Utility: Get Absolute Path ====================
+// ==================== Get Absolute Path ====================
 std::string get_absolute_path(const std::string &path)
 {
-    if (path.empty())
+    if (path.empty() || path[0] == '/')
         return path;
-    if (path[0] == '/')
-        return path;
-
     if (!g_working_dir.empty())
-    {
         return g_working_dir + "/" + path;
-    }
-
     char cwd[PATH_MAX];
     if (getcwd(cwd, sizeof(cwd)))
-    {
         return std::string(cwd) + "/" + path;
-    }
-
     return path;
 }
 
-// ==================== Simple JSON Parser ====================
+// ==================== JSON Parser ====================
 class JsonValue
 {
 public:
@@ -103,7 +91,6 @@ public:
         ARRAY,
         OBJECT
     };
-
     Type type = NUL;
     bool bool_val = false;
     double num_val = 0;
@@ -118,18 +105,9 @@ public:
     JsonValue(const std::string &v) : type(STRING), str_val(v) {}
     JsonValue(const char *v) : type(STRING), str_val(v) {}
 
-    bool as_bool(bool def = false) const
-    {
-        return type == BOOL ? bool_val : def;
-    }
-    int as_int(int def = 0) const
-    {
-        return type == NUMBER ? (int)num_val : def;
-    }
-    std::string as_string(const std::string &def = "") const
-    {
-        return type == STRING ? str_val : def;
-    }
+    bool as_bool(bool def = false) const { return type == BOOL ? bool_val : def; }
+    int as_int(int def = 0) const { return type == NUMBER ? (int)num_val : def; }
+    std::string as_string(const std::string &def = "") const { return type == STRING ? str_val : def; }
 
     const JsonValue &operator[](const std::string &key) const
     {
@@ -140,10 +118,30 @@ public:
         return it != obj_val.end() ? it->second : null_val;
     }
 
+    const JsonValue &operator[](size_t idx) const
+    {
+        static JsonValue null_val;
+        if (type != ARRAY || idx >= arr_val.size())
+            return null_val;
+        return arr_val[idx];
+    }
+
+    size_t size() const
+    {
+        if (type == ARRAY)
+            return arr_val.size();
+        if (type == OBJECT)
+            return obj_val.size();
+        return 0;
+    }
+
     bool has(const std::string &key) const
     {
         return type == OBJECT && obj_val.find(key) != obj_val.end();
     }
+
+    bool is_array() const { return type == ARRAY; }
+    bool is_object() const { return type == OBJECT; }
 };
 
 class JsonParser
@@ -159,9 +157,7 @@ public:
     {
         std::ifstream file(filename);
         if (!file.is_open())
-        {
-            throw std::runtime_error("Cannot open file: " + filename);
-        }
+            throw std::runtime_error("Cannot open: " + filename);
         std::stringstream ss;
         ss << file.rdbuf();
         return parse(ss.str());
@@ -296,9 +292,7 @@ private:
                 }
             }
             else
-            {
                 r += s[p];
-            }
             p++;
         }
         if (p < s.size())
@@ -338,29 +332,61 @@ private:
     }
 };
 
-// ==================== Configuration ====================
-class Config
+// ==================== Forward Rule ====================
+struct ForwardRule
 {
-public:
+    std::string name;
     std::string listen_host = "0.0.0.0";
     int listen_port = 54321;
     std::string target_host = "127.0.0.1";
     int target_port = 19132;
+
+    std::atomic<int> sessions{0};
+    std::atomic<uint64_t> bytes_in{0};
+    std::atomic<uint64_t> bytes_out{0};
+    std::atomic<uint64_t> packets_in{0};
+    std::atomic<uint64_t> packets_out{0};
+
+    ForwardRule() = default;
+    ForwardRule(const ForwardRule &o)
+        : name(o.name), listen_host(o.listen_host), listen_port(o.listen_port),
+          target_host(o.target_host), target_port(o.target_port)
+    {
+        sessions = o.sessions.load();
+        bytes_in = o.bytes_in.load();
+        bytes_out = o.bytes_out.load();
+        packets_in = o.packets_in.load();
+        packets_out = o.packets_out.load();
+    }
+};
+
+// ==================== Configuration ====================
+class Config
+{
+public:
+    // Forward rules
+    std::vector<ForwardRule> forwards;
+
+    // Protocol options
     bool enable_tcp = false;
     bool enable_udp = true;
     int buffer_size = 65535;
     int udp_timeout = 120;
-    int dns_refresh_interval = 3600; // 1 hour in seconds
+    int dns_refresh_interval = 3600;
+    int max_sessions = 100;
+
+    // Logging options (all optional with defaults)
     std::string log_level = "INFO";
     std::string log_file = "forward.log";
     bool log_to_file = true;
     bool log_to_console = true;
+
+    // Daemon options (all optional with defaults)
     bool daemon_mode = false;
-    int max_sessions = 1000;
-    std::string pid_file = "ip_forward.pid";
+    std::string pid_file = "mcbe_forward.pid";
     std::string work_dir = "";
 
-    // Computed absolute paths
+    // Computed paths
     std::string abs_log_file;
     std::string abs_pid_file;
     std::string abs_config_file;
@@ -381,27 +407,57 @@ public:
         try
         {
             abs_config_file = get_absolute_path(filename);
-
             JsonValue json = JsonParser::parse_file(filename);
 
-            listen_host = json["listen_host"].as_string(listen_host);
-            listen_port = json["listen_port"].as_int(listen_port);
-            target_host = json["target_host"].as_string(target_host);
-            target_port = json["target_port"].as_int(target_port);
-            enable_tcp = json["enable_tcp"].as_bool(enable_tcp);
-            enable_udp = json["enable_udp"].as_bool(enable_udp);
-            buffer_size = json["buffer_size"].as_int(buffer_size);
-            udp_timeout = json["udp_timeout"].as_int(udp_timeout);
-            dns_refresh_interval = json["dns_refresh_interval"].as_int(dns_refresh_interval);
-            log_level = json["log_level"].as_string(log_level);
-            log_file = json["log_file"].as_string(log_file);
-            log_to_file = json["log_to_file"].as_bool(log_to_file);
-            log_to_console = json["log_to_console"].as_bool(log_to_console);
-            daemon_mode = json["daemon_mode"].as_bool(daemon_mode);
-            max_sessions = json["max_sessions"].as_int(max_sessions);
-            pid_file = json["pid_file"].as_string(pid_file);
-            work_dir = json["work_dir"].as_string(work_dir);
+            // Parse forwards array
+            if (json.has("forwards") && json["forwards"].is_array())
+            {
+                const auto &fwds = json["forwards"];
+                for (size_t i = 0; i < fwds.size(); i++)
+                {
+                    const auto &f = fwds[i];
+                    ForwardRule rule;
+                    rule.name = f["name"].as_string("Forward" + std::to_string(i + 1));
+                    rule.listen_host = f["listen_host"].as_string("0.0.0.0");
+                    rule.listen_port = f["listen_port"].as_int(54321 + i);
+                    rule.target_host = f["target_host"].as_string("127.0.0.1");
+                    rule.target_port = f["target_port"].as_int(19132);
+                    forwards.push_back(rule);
+                }
+            }
 
+            // Default forward if none defined
+            if (forwards.empty())
+            {
+                ForwardRule rule;
+                rule.name = "Default";
+                rule.listen_host = json["listen_host"].as_string("0.0.0.0");
+                rule.listen_port = json["listen_port"].as_int(54321);
+                rule.target_host = json["target_host"].as_string("127.0.0.1");
+                rule.target_port = json["target_port"].as_int(19132);
+                forwards.push_back(rule);
+            }
+
+            // Protocol options
+            enable_tcp = json["enable_tcp"].as_bool(false);
+            enable_udp = json["enable_udp"].as_bool(true);
+            buffer_size = json["buffer_size"].as_int(65535);
+            udp_timeout = json["udp_timeout"].as_int(120);
+            dns_refresh_interval = json["dns_refresh_interval"].as_int(3600);
+            max_sessions = json["max_sessions"].as_int(100);
+
+            // Logging options (optional with defaults)
+            log_level = json["log_level"].as_string("INFO");
+            log_file = json["log_file"].as_string("forward.log");
+            log_to_file = json["log_to_file"].as_bool(true);
+            log_to_console = json["log_to_console"].as_bool(true);
+
+            // Daemon options (optional with defaults)
+            daemon_mode = json["daemon_mode"].as_bool(false);
+            pid_file = json["pid_file"].as_string("mcbe_forward.pid");
+            work_dir = json["work_dir"].as_string("");
+
+            // Compute absolute paths
             abs_log_file = get_absolute_path(log_file);
             abs_pid_file = get_absolute_path(pid_file);
 
@@ -409,7 +465,7 @@ public:
         }
         catch (const std::exception &e)
         {
-            std::cerr << "[ERROR] Failed to parse config: " << e.what() << std::endl;
+            std::cerr << "[ERROR] Config parse failed: " << e.what() << std::endl;
             return false;
         }
     }
@@ -418,22 +474,34 @@ public:
     {
         std::ofstream file(filename);
         file << R"({
-    "listen_host": "0.0.0.0",
-    "listen_port": 54321,
-    "target_host": "127.0.0.1",
-    "target_port": 19132,
+    "forwards": [
+        {
+            "name": "Server1",
+            "listen_host": "0.0.0.0",
+            "listen_port": 54321,
+            "target_host": "127.0.0.1",
+            "target_port": 19132
+        },
+        {
+            "name": "Server2",
+            "listen_host": "0.0.0.0",
+            "listen_port": 54322,
+            "target_host": "127.0.0.1",
+            "target_port": 19132
+        }
+    ],
     "enable_tcp": false,
     "enable_udp": true,
     "buffer_size": 65535,
     "udp_timeout": 120,
     "dns_refresh_interval": 3600,
+    "max_sessions": 100,
     "log_level": "INFO",
     "log_file": "forward.log",
     "log_to_file": true,
     "log_to_console": true,
     "daemon_mode": false,
-    "max_sessions": 1000,
-    "pid_file": "ip_forward.pid",
+    "pid_file": "mcbe_forward.pid",
     "work_dir": ""
 })";
         file.close();
@@ -442,21 +510,38 @@ public:
     void print() const
     {
         std::cout << "\n";
-        std::cout << "+--------------------------------------------------+\n";
-        std::cout << "|                  CONFIGURATION                   |\n";
-        std::cout << "+--------------------------------------------------+\n";
-        std::cout << "| Listen:       " << listen_host << ":" << listen_port << "\n";
-        std::cout << "| Target:       " << target_host << ":" << target_port << "\n";
-        std::cout << "| UDP:          " << (enable_udp ? "Enabled" : "Disabled") << "\n";
-        std::cout << "| TCP:          " << (enable_tcp ? "Enabled" : "Disabled") << "\n";
+        std::cout << "+======================================================+\n";
+        std::cout << "|                    CONFIGURATION                     |\n";
+        std::cout << "+======================================================+\n";
+        std::cout << "| Protocol:     UDP=" << (enable_udp ? "ON" : "OFF");
+        std::cout << "  TCP=" << (enable_tcp ? "ON" : "OFF") << "\n";
         std::cout << "| Buffer:       " << buffer_size << " bytes\n";
         std::cout << "| UDP Timeout:  " << udp_timeout << " seconds\n";
         std::cout << "| DNS Refresh:  " << dns_refresh_interval << " seconds\n";
+        std::cout << "| Max Sessions: " << max_sessions << " per forward\n";
+        std::cout << "+------------------------------------------------------+\n";
         std::cout << "| Log Level:    " << log_level << "\n";
-        std::cout << "| Log File:     " << abs_log_file << "\n";
-        std::cout << "| Daemon:       " << (daemon_mode ? "Yes" : "No") << "\n";
-        std::cout << "| Max Sessions: " << max_sessions << "\n";
-        std::cout << "+--------------------------------------------------+\n";
+        std::cout << "| Log File:     " << (log_to_file ? abs_log_file : "(disabled)") << "\n";
+        std::cout << "| Log Console:  " << (log_to_console ? "ON" : "OFF") << "\n";
+        std::cout << "| Daemon Mode:  " << (daemon_mode ? "ON" : "OFF") << "\n";
+        std::cout << "| PID File:     " << abs_pid_file << "\n";
+        if (!work_dir.empty())
+        {
+            std::cout << "| Work Dir:     " << work_dir << "\n";
+        }
+        std::cout << "+------------------------------------------------------+\n";
+        std::cout << "|                   FORWARD RULES (" << forwards.size() << ")                   |\n";
+        std::cout << "+------------------------------------------------------+\n";
+
+        for (size_t i = 0; i < forwards.size(); i++)
+        {
+            const auto &f = forwards[i];
+            std::cout << "| [" << (i + 1) << "] " << f.name << "\n";
+            std::cout << "|     " << f.listen_host << ":" << f.listen_port
+                      << " -> " << f.target_host << ":" << f.target_port << "\n";
+        }
+
+        std::cout << "+======================================================+\n";
     }
 };
 
@@ -486,9 +571,7 @@ public:
             if (!file_.is_open())
             {
                 if (to_console_)
-                {
-                    std::cerr << "[WARN] Cannot open log file: " << filename_ << std::endl;
-                }
+                    std::cerr << "[WARN] Cannot open log: " << filename_ << std::endl;
                 to_file_ = false;
             }
         }
@@ -498,22 +581,16 @@ public:
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (file_.is_open())
-        {
             file_.close();
-        }
         if (to_file_ && !filename_.empty())
-        {
             file_.open(filename_, std::ios::app);
-        }
     }
 
     void close()
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (file_.is_open())
-        {
             file_.close();
-        }
     }
 
     void log(LogLevel level, const std::string &msg)
@@ -531,10 +608,7 @@ public:
         std::string line = ss.str();
 
         if (to_console_)
-        {
             std::cout << line << std::endl;
-        }
-
         if (to_file_ && file_.is_open())
         {
             file_ << line << std::endl;
@@ -558,10 +632,8 @@ private:
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                       now.time_since_epoch()) %
                   1000;
-
         char buf[32];
         strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", localtime(&time));
-
         std::stringstream ss;
         ss << buf << "." << std::setfill('0') << std::setw(3) << ms.count();
         return ss.str();
@@ -579,67 +651,43 @@ private:
 class DnsResolver
 {
 public:
-    DnsResolver() : running_(false), is_domain_(false) {}
+    DnsResolver() : running_(false), is_domain_(false), port_(0) {}
+    ~DnsResolver() { stop(); }
 
-    ~DnsResolver()
-    {
-        stop();
-    }
-
-    bool init(const std::string &host, int port)
+    bool init(const std::string &host, int port, const std::string &name)
     {
         hostname_ = host;
         port_ = port;
+        name_ = name;
 
-        // Initial resolution
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_port = htons(port);
 
-        // Check if it's an IP address
         if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) == 1)
         {
-            // It's an IP address, no DNS needed
             is_domain_ = false;
             current_ip_ = host;
-
             std::lock_guard<std::shared_mutex> lock(addr_mutex_);
             target_addr_ = addr;
-
-            Logger::info("DNS: Target is IP address: " + host);
             return true;
         }
 
-        // It's a domain name, resolve it
         is_domain_ = true;
-        if (!resolve_now())
-        {
-            Logger::error("DNS: Initial resolution failed for: " + host);
-            return false;
-        }
-
-        return true;
+        return resolve_now();
     }
 
     void start()
     {
         if (!is_domain_)
-        {
-            Logger::info("DNS: Refresh disabled (target is IP address)");
             return;
-        }
-
         running_ = true;
         resolver_thread_ = std::thread(&DnsResolver::resolver_loop, this);
-
-        Logger::info("DNS: Resolver started, refresh interval: " +
-                     std::to_string(g_config.dns_refresh_interval) + "s");
     }
 
     void stop()
     {
         running_ = false;
-
         if (resolver_thread_.joinable() &&
             resolver_thread_.get_id() != std::this_thread::get_id())
         {
@@ -647,7 +695,6 @@ public:
         }
     }
 
-    // Get current target address (thread-safe read)
     sockaddr_in get_target_addr() const
     {
         std::shared_lock<std::shared_mutex> lock(addr_mutex_);
@@ -660,20 +707,15 @@ public:
         return current_ip_;
     }
 
-    bool is_domain() const
-    {
-        return is_domain_;
-    }
+    bool is_domain() const { return is_domain_; }
+    const std::string &get_hostname() const { return hostname_; }
 
 private:
-    std::string hostname_;
+    std::string hostname_, name_, current_ip_;
     int port_;
-    std::string current_ip_;
     sockaddr_in target_addr_;
     mutable std::shared_mutex addr_mutex_;
-
-    std::atomic<bool> running_;
-    std::atomic<bool> is_domain_;
+    std::atomic<bool> running_, is_domain_;
     std::thread resolver_thread_;
 
     bool resolve_now()
@@ -685,8 +727,7 @@ private:
         int ret = getaddrinfo(hostname_.c_str(), nullptr, &hints, &res);
         if (ret != 0 || !res)
         {
-            Logger::error("DNS: Resolution failed for " + hostname_ +
-                          ": " + gai_strerror(ret));
+            Logger::error("[" + name_ + "] DNS failed: " + hostname_);
             return false;
         }
 
@@ -695,22 +736,19 @@ private:
 
         {
             std::lock_guard<std::shared_mutex> lock(addr_mutex_);
-
-            bool ip_changed = (current_ip_ != new_ip);
-
+            bool changed = (!current_ip_.empty() && current_ip_ != new_ip);
             current_ip_ = new_ip;
             target_addr_.sin_family = AF_INET;
             target_addr_.sin_port = htons(port_);
             target_addr_.sin_addr = addr_in->sin_addr;
 
-            if (ip_changed && !current_ip_.empty())
+            if (changed)
             {
-                Logger::info("DNS: " + hostname_ + " resolved to " + new_ip +
-                             " (IP changed, new sessions will use new IP)");
+                Logger::info("[" + name_ + "] DNS: " + hostname_ + " -> " + new_ip + " (changed)");
             }
             else
             {
-                Logger::debug("DNS: " + hostname_ + " resolved to " + new_ip);
+                Logger::debug("[" + name_ + "] DNS: " + hostname_ + " -> " + new_ip);
             }
         }
 
@@ -720,36 +758,21 @@ private:
 
     void resolver_loop()
     {
-        int sleep_interval = 10; // Check every 10 seconds
         int elapsed = 0;
-
         while (running_ && g_running)
         {
-            std::this_thread::sleep_for(std::chrono::seconds(sleep_interval));
-            elapsed += sleep_interval;
-
+            std::this_thread::sleep_for(std::chrono::seconds(10));
+            elapsed += 10;
             if (!running_ || !g_running)
                 break;
-
-            // Refresh DNS at configured interval
             if (elapsed >= g_config.dns_refresh_interval)
             {
                 elapsed = 0;
-
-                Logger::debug("DNS: Refreshing " + hostname_ + "...");
-                if (!resolve_now())
-                {
-                    Logger::warn("DNS: Refresh failed, keeping old IP: " + current_ip_);
-                }
+                resolve_now();
             }
         }
-
-        Logger::debug("DNS: Resolver stopped");
     }
 };
-
-// Global DNS resolver
-DnsResolver g_dns_resolver;
 
 // ==================== Utility Functions ====================
 void set_nonblocking(int fd)
@@ -761,8 +784,7 @@ void set_nonblocking(int fd)
 std::string addr_to_string(const sockaddr_in &addr)
 {
     char buf[64];
-    snprintf(buf, sizeof(buf), "%s:%d",
-             inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
+    snprintf(buf, sizeof(buf), "%s:%d", inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
     return std::string(buf);
 }
 
@@ -784,9 +806,7 @@ std::string format_bytes(uint64_t bytes)
 bool resolve_host(const std::string &host, sockaddr_in &addr)
 {
     if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) == 1)
-    {
         return true;
-    }
     struct hostent *he = gethostbyname(host.c_str());
     if (he && he->h_addr_list[0])
     {
@@ -801,7 +821,7 @@ void signal_handler(int sig)
     if (sig == SIGHUP)
     {
         Logger::instance().reopen();
-        Logger::info("Received SIGHUP, log file reopened");
+        Logger::info("Log file reopened");
         return;
     }
     g_running = false;
@@ -812,137 +832,92 @@ bool daemonize()
 {
     pid_t pid = fork();
     if (pid < 0)
-    {
-        std::cerr << "First fork failed: " << strerror(errno) << std::endl;
         return false;
-    }
     if (pid > 0)
     {
-        int status;
-        waitpid(pid, &status, 0);
-        exit(WIFEXITED(status) ? WEXITSTATUS(status) : 1);
+        int s;
+        waitpid(pid, &s, 0);
+        exit(WIFEXITED(s) ? WEXITSTATUS(s) : 1);
     }
 
     if (setsid() < 0)
-    {
-        std::cerr << "setsid failed: " << strerror(errno) << std::endl;
         _exit(1);
-    }
-
     signal(SIGHUP, SIG_IGN);
 
     pid = fork();
     if (pid < 0)
-    {
-        std::cerr << "Second fork failed: " << strerror(errno) << std::endl;
         _exit(1);
-    }
     if (pid > 0)
     {
-        std::cout << "Daemon started with PID: " << pid << std::endl;
+        std::cout << "Daemon PID: " << pid << std::endl;
         _exit(0);
     }
 
     umask(022);
-
     if (!g_config.work_dir.empty())
-    {
         chdir(g_config.work_dir.c_str());
-    }
     else if (!g_working_dir.empty())
-    {
         chdir(g_working_dir.c_str());
-    }
 
     close(STDIN_FILENO);
     close(STDOUT_FILENO);
     close(STDERR_FILENO);
-
     int fd = open("/dev/null", O_RDWR);
     if (fd >= 0)
     {
-        dup2(fd, STDIN_FILENO);
-        dup2(fd, STDOUT_FILENO);
-        dup2(fd, STDERR_FILENO);
-        if (fd > STDERR_FILENO)
-        {
+        dup2(fd, 0);
+        dup2(fd, 1);
+        dup2(fd, 2);
+        if (fd > 2)
             close(fd);
-        }
     }
 
     return true;
 }
 
-bool write_pid_file(const std::string &filename)
+bool write_pid_file(const std::string &f)
 {
-    std::ofstream file(filename);
+    std::ofstream file(f);
     if (!file.is_open())
         return false;
     file << getpid();
-    file.close();
     return true;
 }
 
-void remove_pid_file(const std::string &filename)
-{
-    unlink(filename.c_str());
-}
+void remove_pid_file(const std::string &f) { unlink(f.c_str()); }
 
-bool is_already_running(const std::string &pid_file)
+bool is_already_running(const std::string &pf)
 {
-    std::ifstream file(pid_file);
+    std::ifstream file(pf);
     if (!file.is_open())
         return false;
-
     pid_t pid;
     file >> pid;
     file.close();
-
     if (pid <= 0)
         return false;
-
     if (kill(pid, 0) == 0)
-    {
         return true;
-    }
-
-    unlink(pid_file.c_str());
+    unlink(pf.c_str());
     return false;
 }
 
 void generate_service_file()
 {
-    std::string service = R"([Unit]
-Description=IP Forward - Game Server Proxy v)" VERSION R"(
-After=network.target
-Wants=network-online.target
+    std::string svc = "[Unit]\nDescription=IP Forward v" VERSION "\nAfter=network.target\n\n"
+                      "[Service]\nType=forking\nPIDFile=" +
+                      g_config.abs_pid_file + "\n"
+                                              "ExecStart=" +
+                      g_exe_path + " -c " + g_config.abs_config_file + " -d\n"
+                                                                       "ExecReload=/bin/kill -HUP $MAINPID\nRestart=always\nRestartSec=5\n\n"
+                                                                       "[Install]\nWantedBy=multi-user.target\n";
 
-[Service]
-Type=forking
-PIDFile=)" + g_config.abs_pid_file +
-                          R"(
-ExecStart=)" + g_exe_path +
-                          " -c " + g_config.abs_config_file + R"( -d
-ExecReload=/bin/kill -HUP $MAINPID
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-)";
-
-    std::string filename = "ip_forward.service";
-    std::ofstream file(filename);
+    std::ofstream file("ip_forward.service");
     if (file.is_open())
     {
-        file << service;
+        file << svc;
         file.close();
-        std::cout << "Generated: " << filename << "\n\n";
-        std::cout << "Install commands:\n";
-        std::cout << "  sudo cp " << filename << " /etc/systemd/system/\n";
-        std::cout << "  sudo systemctl daemon-reload\n";
-        std::cout << "  sudo systemctl enable ip_forward\n";
-        std::cout << "  sudo systemctl start ip_forward\n";
+        std::cout << "Generated: ip_forward.service\n";
     }
 }
 
@@ -950,58 +925,45 @@ WantedBy=multi-user.target
 class ThreadPool
 {
 public:
-    ThreadPool(size_t threads = 4) : stop_(false)
+    ThreadPool(size_t n = 4) : stop_(false)
     {
-        for (size_t i = 0; i < threads; ++i)
-        {
+        for (size_t i = 0; i < n; ++i)
             workers_.emplace_back([this]
                                   {
                 while (true) {
                     std::function<void()> task;
-                    {
-                        std::unique_lock<std::mutex> lock(mutex_);
-                        cv_.wait(lock, [this] { 
-                            return stop_ || !tasks_.empty(); 
-                        });
-                        if (stop_ && tasks_.empty()) return;
-                        task = std::move(tasks_.front());
-                        tasks_.pop();
-                    }
+                    { std::unique_lock<std::mutex> lk(mtx_); cv_.wait(lk, [this]{ return stop_ || !q_.empty(); });
+                      if (stop_ && q_.empty()) return; task = std::move(q_.front()); q_.pop(); }
                     try { task(); } catch (...) {}
                 } });
-        }
     }
-
     ~ThreadPool()
     {
         {
-            std::unique_lock<std::mutex> lock(mutex_);
+            std::unique_lock<std::mutex> lk(mtx_);
             stop_ = true;
         }
         cv_.notify_all();
         for (auto &w : workers_)
-        {
             if (w.joinable())
                 w.join();
-        }
     }
-
     template <class F>
     void enqueue(F &&f)
     {
         {
-            std::unique_lock<std::mutex> lock(mutex_);
+            std::unique_lock<std::mutex> lk(mtx_);
             if (stop_)
                 return;
-            tasks_.emplace(std::forward<F>(f));
+            q_.emplace(std::forward<F>(f));
         }
         cv_.notify_one();
     }
 
 private:
     std::vector<std::thread> workers_;
-    std::queue<std::function<void()>> tasks_;
-    std::mutex mutex_;
+    std::queue<std::function<void()>> q_;
+    std::mutex mtx_;
     std::condition_variable cv_;
     bool stop_;
 };
@@ -1009,45 +971,27 @@ private:
 // ==================== UDP Session ====================
 struct UdpSession
 {
-    int server_socket;
-    sockaddr_in client_addr;
-    sockaddr_in connected_server_addr; // The IP this session is connected to
-    std::string connected_ip;          // For logging
+    int server_socket = -1;
+    sockaddr_in client_addr{};
+    sockaddr_in connected_server{};
+    std::string connected_ip;
     std::chrono::steady_clock::time_point last_active;
-    std::atomic<uint64_t> packets_sent{0};
-    std::atomic<uint64_t> packets_recv{0};
-    std::atomic<uint64_t> bytes_sent{0};
-    std::atomic<uint64_t> bytes_recv{0};
+    std::atomic<uint64_t> pkts_sent{0}, pkts_recv{0}, bytes_sent{0}, bytes_recv{0};
 
-    UdpSession() : server_socket(-1)
-    {
-        memset(&client_addr, 0, sizeof(client_addr));
-        memset(&connected_server_addr, 0, sizeof(connected_server_addr));
-        update_activity();
-    }
-
+    UdpSession() { update(); }
     ~UdpSession()
     {
         if (server_socket >= 0)
-        {
             close(server_socket);
-            server_socket = -1;
-        }
     }
-
     UdpSession(const UdpSession &) = delete;
     UdpSession &operator=(const UdpSession &) = delete;
 
-    void update_activity()
+    void update() { last_active = std::chrono::steady_clock::now(); }
+    int inactive() const
     {
-        last_active = std::chrono::steady_clock::now();
-    }
-
-    int inactive_seconds() const
-    {
-        auto now = std::chrono::steady_clock::now();
         return std::chrono::duration_cast<std::chrono::seconds>(
-                   now - last_active)
+                   std::chrono::steady_clock::now() - last_active)
             .count();
     }
 };
@@ -1056,193 +1000,167 @@ struct UdpSession
 class UdpForwarder
 {
 public:
-    UdpForwarder() : listen_socket_(-1), running_(false) {}
+    UdpForwarder(ForwardRule &r) : rule_(r), sock_(-1), running_(false) {}
     ~UdpForwarder() { stop(); }
 
     bool start()
     {
-        listen_socket_ = socket(AF_INET, SOCK_DGRAM, 0);
-        if (listen_socket_ < 0)
+        if (!dns_.init(rule_.target_host, rule_.target_port, rule_.name))
         {
-            Logger::error("UDP: Failed to create socket - " + std::string(strerror(errno)));
+            Logger::error("[" + rule_.name + "] DNS init failed: " + rule_.target_host);
+            return false;
+        }
+
+        sock_ = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock_ < 0)
+        {
+            Logger::error("[" + rule_.name + "] socket() failed");
             return false;
         }
 
         int opt = 1;
-        setsockopt(listen_socket_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        setsockopt(sock_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        setsockopt(sock_, SOL_SOCKET, SO_RCVBUF, &g_config.buffer_size, sizeof(g_config.buffer_size));
+        setsockopt(sock_, SOL_SOCKET, SO_SNDBUF, &g_config.buffer_size, sizeof(g_config.buffer_size));
 
-        int buf_size = g_config.buffer_size;
-        setsockopt(listen_socket_, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
-        setsockopt(listen_socket_, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
-
-        sockaddr_in listen_addr{};
-        listen_addr.sin_family = AF_INET;
-        listen_addr.sin_port = htons(g_config.listen_port);
-
-        if (!resolve_host(g_config.listen_host, listen_addr))
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(rule_.listen_port);
+        if (!resolve_host(rule_.listen_host, addr))
         {
-            Logger::error("UDP: Cannot resolve listen host: " + g_config.listen_host);
-            close(listen_socket_);
-            listen_socket_ = -1;
+            Logger::error("[" + rule_.name + "] Cannot resolve: " + rule_.listen_host);
+            close(sock_);
+            sock_ = -1;
             return false;
         }
 
-        if (bind(listen_socket_, (sockaddr *)&listen_addr, sizeof(listen_addr)) < 0)
+        if (bind(sock_, (sockaddr *)&addr, sizeof(addr)) < 0)
         {
-            Logger::error("UDP: Bind failed - " + std::string(strerror(errno)));
-            close(listen_socket_);
-            listen_socket_ = -1;
+            Logger::error("[" + rule_.name + "] bind() failed: " + std::string(strerror(errno)));
+            close(sock_);
+            sock_ = -1;
             return false;
         }
 
-        set_nonblocking(listen_socket_);
+        set_nonblocking(sock_);
         running_ = true;
+        dns_.start();
 
-        forward_thread_ = std::thread(&UdpForwarder::forward_loop, this);
+        fwd_thread_ = std::thread(&UdpForwarder::forward_loop, this);
         cleanup_thread_ = std::thread(&UdpForwarder::cleanup_loop, this);
 
-        Logger::info("UDP: Forwarder started on " + g_config.listen_host + ":" +
-                     std::to_string(g_config.listen_port));
-
+        std::string tgt = rule_.target_host;
+        if (dns_.is_domain())
+            tgt += " (" + dns_.get_current_ip() + ")";
+        Logger::info("[" + rule_.name + "] UDP started :" + std::to_string(rule_.listen_port) +
+                     " -> " + tgt + ":" + std::to_string(rule_.target_port));
         return true;
     }
 
     void stop()
     {
         running_ = false;
-
-        if (listen_socket_ >= 0)
+        dns_.stop();
+        if (sock_ >= 0)
         {
-            shutdown(listen_socket_, SHUT_RDWR);
-            close(listen_socket_);
-            listen_socket_ = -1;
+            shutdown(sock_, SHUT_RDWR);
+            close(sock_);
+            sock_ = -1;
         }
-
-        if (forward_thread_.joinable() &&
-            forward_thread_.get_id() != std::this_thread::get_id())
-        {
-            forward_thread_.join();
-        }
-
-        if (cleanup_thread_.joinable() &&
-            cleanup_thread_.get_id() != std::this_thread::get_id())
-        {
+        if (fwd_thread_.joinable() && fwd_thread_.get_id() != std::this_thread::get_id())
+            fwd_thread_.join();
+        if (cleanup_thread_.joinable() && cleanup_thread_.get_id() != std::this_thread::get_id())
             cleanup_thread_.join();
-        }
-
         {
-            std::lock_guard<std::mutex> lock(sessions_mutex_);
-            size_t count = sessions_.size();
+            std::lock_guard<std::mutex> lk(sess_mtx_);
             sessions_.clear();
-            g_udp_sessions = 0;
-            if (count > 0)
-            {
-                Logger::info("UDP: Cleaned up " + std::to_string(count) + " sessions");
-            }
+            rule_.sessions = 0;
         }
-
-        Logger::info("UDP: Forwarder stopped");
+        Logger::info("[" + rule_.name + "] UDP stopped");
     }
 
-private:
-    int listen_socket_;
-    std::atomic<bool> running_;
-    std::thread forward_thread_;
-    std::thread cleanup_thread_;
+    const DnsResolver &dns() const { return dns_; }
 
-    std::mutex sessions_mutex_;
+private:
+    ForwardRule &rule_;
+    DnsResolver dns_;
+    int sock_;
+    std::atomic<bool> running_;
+    std::thread fwd_thread_, cleanup_thread_;
+    std::mutex sess_mtx_;
     std::map<std::string, std::unique_ptr<UdpSession>> sessions_;
 
-    UdpSession *get_or_create_session(const sockaddr_in &client_addr)
+    UdpSession *get_session(const sockaddr_in &client)
     {
-        std::string key = addr_to_string(client_addr);
-
-        std::lock_guard<std::mutex> lock(sessions_mutex_);
+        std::string key = addr_to_string(client);
+        std::lock_guard<std::mutex> lk(sess_mtx_);
 
         auto it = sessions_.find(key);
         if (it != sessions_.end())
-        {
             return it->second.get();
-        }
 
         if ((int)sessions_.size() >= g_config.max_sessions)
         {
-            Logger::warn("UDP: Max sessions reached (" + std::to_string(g_config.max_sessions) + ")");
+            Logger::warn("[" + rule_.name + "] Max sessions reached");
             return nullptr;
         }
 
-        // Get CURRENT target address from DNS resolver
-        sockaddr_in target_addr = g_dns_resolver.get_target_addr();
-        std::string target_ip = g_dns_resolver.get_current_ip();
+        auto sess = std::make_unique<UdpSession>();
+        sess->client_addr = client;
+        sess->connected_server = dns_.get_target_addr();
+        sess->connected_ip = dns_.get_current_ip();
 
-        auto session = std::make_unique<UdpSession>();
-        session->client_addr = client_addr;
-        session->connected_server_addr = target_addr;
-        session->connected_ip = target_ip;
-
-        // Create socket for this session
-        session->server_socket = socket(AF_INET, SOCK_DGRAM, 0);
-        if (session->server_socket < 0)
+        sess->server_socket = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sess->server_socket < 0)
         {
-            Logger::error("UDP: Failed to create server socket");
+            Logger::error("[" + rule_.name + "] socket() failed");
             return nullptr;
         }
 
-        // Connect to target (uses current resolved IP)
-        if (connect(session->server_socket,
-                    (sockaddr *)&target_addr, sizeof(target_addr)) < 0)
+        if (connect(sess->server_socket, (sockaddr *)&sess->connected_server, sizeof(sess->connected_server)) < 0)
         {
-            Logger::error("UDP: Failed to connect to target " + target_ip);
-            close(session->server_socket);
+            Logger::error("[" + rule_.name + "] connect() failed: " + sess->connected_ip);
+            close(sess->server_socket);
             return nullptr;
         }
 
-        set_nonblocking(session->server_socket);
+        set_nonblocking(sess->server_socket);
+        UdpSession *ptr = sess.get();
+        sessions_[key] = std::move(sess);
+        rule_.sessions++;
 
-        UdpSession *raw_ptr = session.get();
-        sessions_[key] = std::move(session);
-        g_udp_sessions++;
-
-        Logger::info("UDP: New player " + key + " -> " + target_ip + ":" +
-                     std::to_string(g_config.target_port) +
+        Logger::info("[" + rule_.name + "] New: " + key + " -> " + ptr->connected_ip +
                      " (online: " + std::to_string(sessions_.size()) + ")");
-
-        return raw_ptr;
+        return ptr;
     }
 
     void forward_loop()
     {
-        std::vector<char> buffer(g_config.buffer_size);
+        std::vector<char> buf(g_config.buffer_size);
 
         while (running_ && g_running)
         {
-            fd_set read_fds;
-            FD_ZERO(&read_fds);
-
-            if (listen_socket_ < 0)
+            fd_set fds;
+            FD_ZERO(&fds);
+            if (sock_ < 0)
                 break;
-            FD_SET(listen_socket_, &read_fds);
+            FD_SET(sock_, &fds);
+            int maxfd = sock_;
 
-            int max_fd = listen_socket_;
-
-            // Collect active sessions
-            std::vector<std::pair<std::string, UdpSession *>> active_sessions;
+            std::vector<std::pair<std::string, UdpSession *>> active;
             {
-                std::lock_guard<std::mutex> lock(sessions_mutex_);
-                for (auto &pair : sessions_)
-                {
-                    if (pair.second && pair.second->server_socket >= 0)
+                std::lock_guard<std::mutex> lk(sess_mtx_);
+                for (auto &p : sessions_)
+                    if (p.second && p.second->server_socket >= 0)
                     {
-                        FD_SET(pair.second->server_socket, &read_fds);
-                        max_fd = std::max(max_fd, pair.second->server_socket);
-                        active_sessions.emplace_back(pair.first, pair.second.get());
+                        FD_SET(p.second->server_socket, &fds);
+                        maxfd = std::max(maxfd, p.second->server_socket);
+                        active.emplace_back(p.first, p.second.get());
                     }
-                }
             }
 
-            timeval tv{0, 50000}; // 50ms
-            int ret = select(max_fd + 1, &read_fds, nullptr, nullptr, &tv);
-
+            timeval tv{0, 50000};
+            int ret = select(maxfd + 1, &fds, nullptr, nullptr, &tv);
             if (ret < 0)
             {
                 if (errno == EINTR)
@@ -1253,75 +1171,62 @@ private:
                 continue;
 
             // Client -> Server
-            if (listen_socket_ >= 0 && FD_ISSET(listen_socket_, &read_fds))
+            if (sock_ >= 0 && FD_ISSET(sock_, &fds))
             {
-                sockaddr_in client_addr{};
-                socklen_t addr_len = sizeof(client_addr);
-
-                ssize_t recv_len = recvfrom(listen_socket_, buffer.data(),
-                                            buffer.size(), 0,
-                                            (sockaddr *)&client_addr, &addr_len);
-
-                if (recv_len > 0)
+                sockaddr_in client{};
+                socklen_t len = sizeof(client);
+                ssize_t n = recvfrom(sock_, buf.data(), buf.size(), 0, (sockaddr *)&client, &len);
+                if (n > 0)
                 {
-                    g_packets_in++;
-                    g_bytes_in += recv_len;
+                    rule_.packets_in++;
+                    rule_.bytes_in += n;
+                    g_total_packets_in++;
+                    g_total_bytes_in += n;
 
-                    UdpSession *session = get_or_create_session(client_addr);
-                    if (session && session->server_socket >= 0)
+                    UdpSession *s = get_session(client);
+                    if (s && s->server_socket >= 0)
                     {
-                        // Session already connected to its target IP
-                        // Even if DNS changed, this session keeps its connection
-                        ssize_t sent = send(session->server_socket,
-                                            buffer.data(), recv_len, 0);
+                        ssize_t sent = send(s->server_socket, buf.data(), n, 0);
                         if (sent > 0)
                         {
-                            g_packets_out++;
-                            g_bytes_out += sent;
-                            session->packets_sent++;
-                            session->bytes_sent += sent;
-                            session->update_activity();
-
-                            Logger::debug("UDP: " + addr_to_string(client_addr) +
-                                          " -> " + session->connected_ip +
-                                          " (" + std::to_string(recv_len) + " B)");
+                            rule_.packets_out++;
+                            rule_.bytes_out += sent;
+                            g_total_packets_out++;
+                            g_total_bytes_out += sent;
+                            s->pkts_sent++;
+                            s->bytes_sent += sent;
+                            s->update();
                         }
                     }
                 }
             }
 
             // Server -> Client
-            for (auto &pair : active_sessions)
+            for (auto &p : active)
             {
-                if (pair.second && pair.second->server_socket >= 0 &&
-                    FD_ISSET(pair.second->server_socket, &read_fds))
+                if (p.second && p.second->server_socket >= 0 && FD_ISSET(p.second->server_socket, &fds))
                 {
-
-                    ssize_t recv_len = recv(pair.second->server_socket,
-                                            buffer.data(), buffer.size(), 0);
-
-                    if (recv_len > 0)
+                    ssize_t n = recv(p.second->server_socket, buf.data(), buf.size(), 0);
+                    if (n > 0)
                     {
-                        g_packets_in++;
-                        g_bytes_in += recv_len;
+                        rule_.packets_in++;
+                        rule_.bytes_in += n;
+                        g_total_packets_in++;
+                        g_total_bytes_in += n;
 
-                        if (listen_socket_ >= 0)
+                        if (sock_ >= 0)
                         {
-                            ssize_t sent = sendto(listen_socket_, buffer.data(), recv_len, 0,
-                                                  (sockaddr *)&pair.second->client_addr,
-                                                  sizeof(pair.second->client_addr));
-
+                            ssize_t sent = sendto(sock_, buf.data(), n, 0,
+                                                  (sockaddr *)&p.second->client_addr, sizeof(p.second->client_addr));
                             if (sent > 0)
                             {
-                                g_packets_out++;
-                                g_bytes_out += sent;
-                                pair.second->packets_recv++;
-                                pair.second->bytes_recv += sent;
-                                pair.second->update_activity();
-
-                                Logger::debug("UDP: " + pair.second->connected_ip +
-                                              " -> " + pair.first +
-                                              " (" + std::to_string(recv_len) + " B)");
+                                rule_.packets_out++;
+                                rule_.bytes_out += sent;
+                                g_total_packets_out++;
+                                g_total_bytes_out += sent;
+                                p.second->pkts_recv++;
+                                p.second->bytes_recv += sent;
+                                p.second->update();
                             }
                         }
                     }
@@ -1335,34 +1240,20 @@ private:
         while (running_ && g_running)
         {
             std::this_thread::sleep_for(std::chrono::seconds(5));
-
             if (!running_)
                 break;
 
             std::vector<std::string> expired;
-
             {
-                std::lock_guard<std::mutex> lock(sessions_mutex_);
-
-                for (auto &pair : sessions_)
+                std::lock_guard<std::mutex> lk(sess_mtx_);
+                for (auto &p : sessions_)
+                    if (p.second && p.second->inactive() > g_config.udp_timeout)
+                        expired.push_back(p.first);
+                for (auto &k : expired)
                 {
-                    if (pair.second &&
-                        pair.second->inactive_seconds() > g_config.udp_timeout)
-                    {
-                        expired.push_back(pair.first);
-                    }
-                }
-
-                for (const auto &key : expired)
-                {
-                    auto it = sessions_.find(key);
-                    if (it != sessions_.end())
-                    {
-                        Logger::info("UDP: Session timeout " + key +
-                                     " (was connected to " + it->second->connected_ip + ")");
-                        sessions_.erase(it);
-                        g_udp_sessions--;
-                    }
+                    Logger::info("[" + rule_.name + "] Timeout: " + k);
+                    sessions_.erase(k);
+                    rule_.sessions--;
                 }
             }
         }
@@ -1373,72 +1264,57 @@ private:
 class TcpConnection
 {
 public:
-    TcpConnection(int client_fd, const sockaddr_in &client_addr)
-        : client_fd_(client_fd), server_fd_(-1),
-          client_addr_(client_addr), running_(false) {}
-
+    TcpConnection(int cfd, const sockaddr_in &caddr, ForwardRule &r, DnsResolver &d)
+        : cfd_(cfd), sfd_(-1), caddr_(caddr), rule_(r), dns_(d), running_(false) {}
     ~TcpConnection() { stop(); }
-
     TcpConnection(const TcpConnection &) = delete;
     TcpConnection &operator=(const TcpConnection &) = delete;
 
     bool start()
     {
-        server_fd_ = socket(AF_INET, SOCK_STREAM, 0);
-        if (server_fd_ < 0)
+        sfd_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (sfd_ < 0)
         {
-            Logger::error("TCP: Failed to create server socket");
+            Logger::error("[" + rule_.name + "] socket() failed");
             return false;
         }
 
-        // Get CURRENT target address from DNS resolver
-        sockaddr_in target_addr = g_dns_resolver.get_target_addr();
-        connected_ip_ = g_dns_resolver.get_current_ip();
+        sockaddr_in target = dns_.get_target_addr();
+        connected_ip_ = dns_.get_current_ip();
 
-        struct timeval tv;
-        tv.tv_sec = 10;
-        tv.tv_usec = 0;
-        setsockopt(server_fd_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        timeval tv{10, 0};
+        setsockopt(sfd_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
-        if (connect(server_fd_, (sockaddr *)&target_addr, sizeof(target_addr)) < 0)
+        if (connect(sfd_, (sockaddr *)&target, sizeof(target)) < 0)
         {
-            Logger::error("TCP: Failed to connect to " + connected_ip_ +
-                          " - " + std::string(strerror(errno)));
-            close(server_fd_);
-            server_fd_ = -1;
+            Logger::error("[" + rule_.name + "] connect() failed: " + connected_ip_);
+            close(sfd_);
+            sfd_ = -1;
             return false;
         }
 
         running_ = true;
-        g_tcp_connections++;
-
-        Logger::info("TCP: New player " + addr_to_string(client_addr_) +
-                     " -> " + connected_ip_ + ":" + std::to_string(g_config.target_port) +
-                     " (online: " + std::to_string(g_tcp_connections.load()) + ")");
-
+        rule_.sessions++;
+        Logger::info("[" + rule_.name + "] TCP: " + addr_to_string(caddr_) + " -> " + connected_ip_ +
+                     " (online: " + std::to_string(rule_.sessions.load()) + ")");
         return true;
     }
 
     void run()
     {
-        std::vector<char> buffer(g_config.buffer_size);
-
+        std::vector<char> buf(g_config.buffer_size);
         while (running_ && g_running)
         {
-            fd_set read_fds;
-            FD_ZERO(&read_fds);
-
-            if (client_fd_ < 0 || server_fd_ < 0)
+            fd_set fds;
+            FD_ZERO(&fds);
+            if (cfd_ < 0 || sfd_ < 0)
                 break;
-
-            FD_SET(client_fd_, &read_fds);
-            FD_SET(server_fd_, &read_fds);
-
-            int max_fd = std::max(client_fd_, server_fd_);
+            FD_SET(cfd_, &fds);
+            FD_SET(sfd_, &fds);
+            int maxfd = std::max(cfd_, sfd_);
 
             timeval tv{1, 0};
-            int ret = select(max_fd + 1, &read_fds, nullptr, nullptr, &tv);
-
+            int ret = select(maxfd + 1, &fds, nullptr, nullptr, &tv);
             if (ret < 0)
             {
                 if (errno == EINTR)
@@ -1448,43 +1324,42 @@ public:
             if (ret == 0)
                 continue;
 
-            // Client -> Server
-            if (client_fd_ >= 0 && FD_ISSET(client_fd_, &read_fds))
+            if (cfd_ >= 0 && FD_ISSET(cfd_, &fds))
             {
-                ssize_t len = recv(client_fd_, buffer.data(), buffer.size(), 0);
-                if (len <= 0)
+                ssize_t n = recv(cfd_, buf.data(), buf.size(), 0);
+                if (n <= 0)
                     break;
-
-                g_packets_in++;
-                g_bytes_in += len;
-
-                ssize_t sent = send(server_fd_, buffer.data(), len, 0);
-                if (sent <= 0)
+                rule_.packets_in++;
+                rule_.bytes_in += n;
+                g_total_packets_in++;
+                g_total_bytes_in += n;
+                ssize_t s = send(sfd_, buf.data(), n, 0);
+                if (s <= 0)
                     break;
-
-                g_packets_out++;
-                g_bytes_out += sent;
+                rule_.packets_out++;
+                rule_.bytes_out += s;
+                g_total_packets_out++;
+                g_total_bytes_out += s;
             }
 
-            // Server -> Client
-            if (server_fd_ >= 0 && FD_ISSET(server_fd_, &read_fds))
+            if (sfd_ >= 0 && FD_ISSET(sfd_, &fds))
             {
-                ssize_t len = recv(server_fd_, buffer.data(), buffer.size(), 0);
-                if (len <= 0)
+                ssize_t n = recv(sfd_, buf.data(), buf.size(), 0);
+                if (n <= 0)
                     break;
-
-                g_packets_in++;
-                g_bytes_in += len;
-
-                ssize_t sent = send(client_fd_, buffer.data(), len, 0);
-                if (sent <= 0)
+                rule_.packets_in++;
+                rule_.bytes_in += n;
+                g_total_packets_in++;
+                g_total_bytes_in += n;
+                ssize_t s = send(cfd_, buf.data(), n, 0);
+                if (s <= 0)
                     break;
-
-                g_packets_out++;
-                g_bytes_out += sent;
+                rule_.packets_out++;
+                rule_.bytes_out += s;
+                g_total_packets_out++;
+                g_total_bytes_out += s;
             }
         }
-
         stop();
     }
 
@@ -1492,29 +1367,27 @@ public:
     {
         if (!running_.exchange(false))
             return;
-
-        if (client_fd_ >= 0)
+        if (cfd_ >= 0)
         {
-            shutdown(client_fd_, SHUT_RDWR);
-            close(client_fd_);
-            client_fd_ = -1;
+            shutdown(cfd_, SHUT_RDWR);
+            close(cfd_);
+            cfd_ = -1;
         }
-        if (server_fd_ >= 0)
+        if (sfd_ >= 0)
         {
-            shutdown(server_fd_, SHUT_RDWR);
-            close(server_fd_);
-            server_fd_ = -1;
+            shutdown(sfd_, SHUT_RDWR);
+            close(sfd_);
+            sfd_ = -1;
         }
-
-        g_tcp_connections--;
-        Logger::info("TCP: Player disconnected " + addr_to_string(client_addr_) +
-                     " (was connected to " + connected_ip_ + ")");
+        rule_.sessions--;
+        Logger::info("[" + rule_.name + "] TCP closed: " + addr_to_string(caddr_));
     }
 
 private:
-    int client_fd_;
-    int server_fd_;
-    sockaddr_in client_addr_;
+    int cfd_, sfd_;
+    sockaddr_in caddr_;
+    ForwardRule &rule_;
+    DnsResolver &dns_;
     std::string connected_ip_;
     std::atomic<bool> running_;
 };
@@ -1523,175 +1396,220 @@ private:
 class TcpForwarder
 {
 public:
-    TcpForwarder() : listen_socket_(-1), running_(false), pool_(8) {}
+    TcpForwarder(ForwardRule &r) : rule_(r), sock_(-1), running_(false), pool_(4) {}
     ~TcpForwarder() { stop(); }
 
     bool start()
     {
-        listen_socket_ = socket(AF_INET, SOCK_STREAM, 0);
-        if (listen_socket_ < 0)
+        if (!dns_.init(rule_.target_host, rule_.target_port, rule_.name))
         {
-            Logger::error("TCP: Failed to create socket");
+            Logger::error("[" + rule_.name + "] DNS init failed");
+            return false;
+        }
+
+        sock_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock_ < 0)
+        {
+            Logger::error("[" + rule_.name + "] socket() failed");
             return false;
         }
 
         int opt = 1;
-        setsockopt(listen_socket_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        setsockopt(sock_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-        sockaddr_in listen_addr{};
-        listen_addr.sin_family = AF_INET;
-        listen_addr.sin_port = htons(g_config.listen_port);
-
-        if (!resolve_host(g_config.listen_host, listen_addr))
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(rule_.listen_port);
+        if (!resolve_host(rule_.listen_host, addr))
         {
-            Logger::error("TCP: Cannot resolve listen host");
-            close(listen_socket_);
-            listen_socket_ = -1;
+            close(sock_);
+            sock_ = -1;
             return false;
         }
 
-        if (bind(listen_socket_, (sockaddr *)&listen_addr, sizeof(listen_addr)) < 0)
+        if (bind(sock_, (sockaddr *)&addr, sizeof(addr)) < 0)
         {
-            Logger::error("TCP: Bind failed - " + std::string(strerror(errno)));
-            close(listen_socket_);
-            listen_socket_ = -1;
+            Logger::error("[" + rule_.name + "] bind() failed");
+            close(sock_);
+            sock_ = -1;
             return false;
         }
 
-        if (listen(listen_socket_, 128) < 0)
+        if (listen(sock_, 128) < 0)
         {
-            Logger::error("TCP: Listen failed");
-            close(listen_socket_);
-            listen_socket_ = -1;
+            close(sock_);
+            sock_ = -1;
             return false;
         }
 
-        set_nonblocking(listen_socket_);
+        set_nonblocking(sock_);
         running_ = true;
-
+        dns_.start();
         accept_thread_ = std::thread(&TcpForwarder::accept_loop, this);
 
-        Logger::info("TCP: Forwarder started on " + g_config.listen_host + ":" +
-                     std::to_string(g_config.listen_port));
-
+        Logger::info("[" + rule_.name + "] TCP started :" + std::to_string(rule_.listen_port));
         return true;
     }
 
     void stop()
     {
         running_ = false;
-
-        if (listen_socket_ >= 0)
+        dns_.stop();
+        if (sock_ >= 0)
         {
-            shutdown(listen_socket_, SHUT_RDWR);
-            close(listen_socket_);
-            listen_socket_ = -1;
+            shutdown(sock_, SHUT_RDWR);
+            close(sock_);
+            sock_ = -1;
         }
-
-        if (accept_thread_.joinable() &&
-            accept_thread_.get_id() != std::this_thread::get_id())
-        {
+        if (accept_thread_.joinable() && accept_thread_.get_id() != std::this_thread::get_id())
             accept_thread_.join();
-        }
-
         {
-            std::lock_guard<std::mutex> lock(connections_mutex_);
-            for (auto &conn : connections_)
-            {
-                if (conn)
-                    conn->stop();
-            }
-            connections_.clear();
+            std::lock_guard<std::mutex> lk(conns_mtx_);
+            for (auto &c : conns_)
+                if (c)
+                    c->stop();
+            conns_.clear();
         }
-
-        Logger::info("TCP: Forwarder stopped");
+        Logger::info("[" + rule_.name + "] TCP stopped");
     }
 
 private:
-    int listen_socket_;
+    ForwardRule &rule_;
+    DnsResolver dns_;
+    int sock_;
     std::atomic<bool> running_;
     std::thread accept_thread_;
     ThreadPool pool_;
-
-    std::mutex connections_mutex_;
-    std::list<std::shared_ptr<TcpConnection>> connections_;
+    std::mutex conns_mtx_;
+    std::list<std::shared_ptr<TcpConnection>> conns_;
 
     void accept_loop()
     {
         while (running_ && g_running)
         {
-            fd_set read_fds;
-            FD_ZERO(&read_fds);
-
-            if (listen_socket_ < 0)
+            fd_set fds;
+            FD_ZERO(&fds);
+            if (sock_ < 0)
                 break;
-            FD_SET(listen_socket_, &read_fds);
-
+            FD_SET(sock_, &fds);
             timeval tv{1, 0};
-            if (select(listen_socket_ + 1, &read_fds, nullptr, nullptr, &tv) <= 0)
+            if (select(sock_ + 1, &fds, nullptr, nullptr, &tv) <= 0)
+                continue;
+
+            sockaddr_in client{};
+            socklen_t len = sizeof(client);
+            int cfd = accept(sock_, (sockaddr *)&client, &len);
+            if (cfd < 0)
+                continue;
+
+            if (rule_.sessions >= g_config.max_sessions)
             {
+                Logger::warn("[" + rule_.name + "] Max sessions");
+                close(cfd);
                 continue;
             }
 
-            sockaddr_in client_addr{};
-            socklen_t addr_len = sizeof(client_addr);
-
-            int client_fd = accept(listen_socket_, (sockaddr *)&client_addr, &addr_len);
-            if (client_fd < 0)
-                continue;
-
-            if (g_tcp_connections >= g_config.max_sessions)
-            {
-                Logger::warn("TCP: Max connections reached");
-                close(client_fd);
-                continue;
-            }
-
-            auto conn = std::make_shared<TcpConnection>(client_fd, client_addr);
+            auto conn = std::make_shared<TcpConnection>(cfd, client, rule_, dns_);
             if (conn->start())
             {
                 {
-                    std::lock_guard<std::mutex> lock(connections_mutex_);
-                    connections_.remove_if([](const std::shared_ptr<TcpConnection> &c)
-                                           { return !c || c.use_count() == 1; });
-                    connections_.push_back(conn);
+                    std::lock_guard<std::mutex> lk(conns_mtx_);
+                    conns_.remove_if([](auto &c)
+                                     { return !c || c.use_count() == 1; });
+                    conns_.push_back(conn);
                 }
-
                 pool_.enqueue([conn]()
                               { conn->run(); });
             }
             else
-            {
-                close(client_fd);
-            }
+                close(cfd);
         }
     }
 };
 
+// ==================== Forward Manager ====================
+class ForwardManager
+{
+public:
+    bool start()
+    {
+        for (auto &r : g_config.forwards)
+        {
+            if (g_config.enable_udp)
+            {
+                auto f = std::make_unique<UdpForwarder>(r);
+                if (!f->start())
+                    return false;
+                udp_.push_back(std::move(f));
+            }
+            if (g_config.enable_tcp)
+            {
+                auto f = std::make_unique<TcpForwarder>(r);
+                if (!f->start())
+                    return false;
+                tcp_.push_back(std::move(f));
+            }
+        }
+        return true;
+    }
+
+    void stop()
+    {
+        for (auto &f : udp_)
+            if (f)
+                f->stop();
+        for (auto &f : tcp_)
+            if (f)
+                f->stop();
+        udp_.clear();
+        tcp_.clear();
+    }
+
+    void print_status()
+    {
+        std::stringstream ss;
+        ss << "=== Status ===\n";
+
+        int total = 0;
+        for (auto &r : g_config.forwards)
+        {
+            total += r.sessions.load();
+            ss << "[" << r.name << "] Sessions: " << r.sessions.load()
+               << " | In: " << format_bytes(r.bytes_in.load())
+               << " | Out: " << format_bytes(r.bytes_out.load());
+
+            for (auto &u : udp_)
+            {
+                if (u && u->dns().get_hostname() == r.target_host && u->dns().is_domain())
+                {
+                    ss << " | IP: " << u->dns().get_current_ip();
+                    break;
+                }
+            }
+            ss << "\n";
+        }
+
+        ss << "Total: " << total << " sessions | "
+           << format_bytes(g_total_bytes_in.load()) << " in | "
+           << format_bytes(g_total_bytes_out.load()) << " out";
+
+        Logger::info(ss.str());
+    }
+
+private:
+    std::vector<std::unique_ptr<UdpForwarder>> udp_;
+    std::vector<std::unique_ptr<TcpForwarder>> tcp_;
+};
+
 // ==================== Status Monitor ====================
-void status_monitor()
+void status_monitor(ForwardManager &mgr)
 {
     while (g_running)
     {
-        std::this_thread::sleep_for(std::chrono::seconds(30));
-
+        std::this_thread::sleep_for(std::chrono::seconds(60));
         if (!g_running)
             break;
-
-        std::string target_info = g_config.target_host;
-        if (g_dns_resolver.is_domain())
-        {
-            target_info += " (" + g_dns_resolver.get_current_ip() + ")";
-        }
-
-        std::stringstream ss;
-        ss << "Status | UDP: " << g_udp_sessions.load()
-           << " | TCP: " << g_tcp_connections.load()
-           << " | In: " << format_bytes(g_bytes_in.load())
-           << " | Out: " << format_bytes(g_bytes_out.load())
-           << " | Target: " << target_info;
-
-        Logger::info(ss.str());
+        mgr.print_status();
     }
 }
 
@@ -1708,68 +1626,46 @@ void print_banner()
 )" << std::endl;
 }
 
-void print_usage(const char *prog)
+void print_usage(const char *p)
 {
-    std::cout << "Usage: " << prog << " [options]\n\n";
-    std::cout << "Options:\n";
-    std::cout << "  -c, --config <file>     Config file (default: config.json)\n";
-    std::cout << "  -d, --daemon            Run as daemon (background)\n";
-    std::cout << "  -g, --generate-service  Generate systemd service file\n";
-    std::cout << "  -s, --stop              Stop running daemon\n";
-    std::cout << "  -r, --reload            Reload DNS (send SIGUSR1)\n";
-    std::cout << "  -h, --help              Show this help\n";
-    std::cout << "\n";
+    std::cout << "Usage: " << p << " [options]\n\n"
+              << "Options:\n"
+              << "  -c, --config <file>     Config file (default: config.json)\n"
+              << "  -d, --daemon            Run as daemon\n"
+              << "  -g, --generate-service  Generate systemd service\n"
+              << "  -s, --stop              Stop daemon\n"
+              << "  -h, --help              Show help\n\n";
 }
 
 int main(int argc, char *argv[])
 {
-    // Save working directory and executable path
     char cwd[PATH_MAX];
     if (getcwd(cwd, sizeof(cwd)))
-    {
         g_working_dir = cwd;
-    }
 
-    char exe_buf[PATH_MAX];
-    ssize_t len = readlink("/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
+    char exe[PATH_MAX];
+    ssize_t len = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
     if (len > 0)
     {
-        exe_buf[len] = '\0';
-        g_exe_path = exe_buf;
+        exe[len] = '\0';
+        g_exe_path = exe;
     }
 
     std::string config_file = "config.json";
-    bool force_daemon = false;
-    bool generate_service = false;
-    bool stop_daemon = false;
-    bool reload_dns = false;
+    bool force_daemon = false, gen_svc = false, stop_daemon = false;
 
-    // Parse arguments
     for (int i = 1; i < argc; i++)
     {
-        std::string arg = argv[i];
-        if (arg == "-c" || arg == "--config")
-        {
-            if (i + 1 < argc)
-                config_file = argv[++i];
-        }
-        else if (arg == "-d" || arg == "--daemon")
-        {
+        std::string a = argv[i];
+        if ((a == "-c" || a == "--config") && i + 1 < argc)
+            config_file = argv[++i];
+        else if (a == "-d" || a == "--daemon")
             force_daemon = true;
-        }
-        else if (arg == "-g" || arg == "--generate-service")
-        {
-            generate_service = true;
-        }
-        else if (arg == "-s" || arg == "--stop")
-        {
+        else if (a == "-g" || a == "--generate-service")
+            gen_svc = true;
+        else if (a == "-s" || a == "--stop")
             stop_daemon = true;
-        }
-        else if (arg == "-r" || arg == "--reload")
-        {
-            reload_dns = true;
-        }
-        else if (arg == "-h" || arg == "--help")
+        else if (a == "-h" || a == "--help")
         {
             print_usage(argv[0]);
             return 0;
@@ -1777,20 +1673,20 @@ int main(int argc, char *argv[])
     }
 
     // Load config
-    std::ifstream check(config_file);
-    if (!check.good())
+    std::ifstream chk(config_file);
+    if (!chk.good())
     {
         std::cout << "[INFO] Creating default config: " << config_file << std::endl;
         g_config.create_default(config_file);
     }
-    check.close();
+    chk.close();
 
     if (!g_config.load(config_file))
     {
-        std::cout << "[WARN] Using default configuration" << std::endl;
+        std::cout << "[WARN] Using defaults" << std::endl;
     }
 
-    // Handle stop command
+    // Stop daemon
     if (stop_daemon)
     {
         if (is_already_running(g_config.abs_pid_file))
@@ -1799,195 +1695,103 @@ int main(int argc, char *argv[])
             pid_t pid;
             pf >> pid;
             pf.close();
-
-            std::cout << "Stopping daemon (PID: " << pid << ")..." << std::endl;
+            std::cout << "Stopping PID " << pid << "..." << std::endl;
             kill(pid, SIGTERM);
-
             for (int i = 0; i < 30; i++)
             {
                 usleep(100000);
                 if (kill(pid, 0) != 0)
                 {
-                    std::cout << "Daemon stopped." << std::endl;
+                    std::cout << "Stopped.\n";
                     return 0;
                 }
             }
-
-            std::cerr << "Sending SIGKILL..." << std::endl;
             kill(pid, SIGKILL);
             return 0;
         }
-        std::cout << "Daemon is not running." << std::endl;
+        std::cout << "Not running.\n";
         return 0;
     }
 
-    // Handle reload DNS command
-    if (reload_dns)
-    {
-        if (is_already_running(g_config.abs_pid_file))
-        {
-            std::ifstream pf(g_config.abs_pid_file);
-            pid_t pid;
-            pf >> pid;
-            pf.close();
-
-            std::cout << "Sending reload signal to daemon (PID: " << pid << ")..." << std::endl;
-            kill(pid, SIGUSR1);
-            std::cout << "Done." << std::endl;
-            return 0;
-        }
-        std::cout << "Daemon is not running." << std::endl;
-        return 1;
-    }
-
-    // Generate service file
-    if (generate_service)
+    // Generate service
+    if (gen_svc)
     {
         print_banner();
         generate_service_file();
         return 0;
     }
 
-    // Check if already running
+    // Check running
     if (is_already_running(g_config.abs_pid_file))
     {
-        std::cerr << "[ERROR] Daemon is already running. Use -s to stop it first." << std::endl;
+        std::cerr << "[ERROR] Already running. Use -s to stop.\n";
         return 1;
     }
 
     print_banner();
 
-    // Initialize DNS resolver BEFORE daemonizing
-    if (!g_dns_resolver.init(g_config.target_host, g_config.target_port))
-    {
-        std::cerr << "[ERROR] Failed to resolve target host: " << g_config.target_host << std::endl;
-        return 1;
-    }
-
-    // Daemonize if requested
+    // Daemonize
     if (force_daemon || g_config.daemon_mode)
     {
-        std::cout << "[INFO] Starting daemon mode..." << std::endl;
-        std::cout << "[INFO] Target: " << g_config.target_host;
-        if (g_dns_resolver.is_domain())
-        {
-            std::cout << " (" << g_dns_resolver.get_current_ip() << ")";
-        }
-        std::cout << std::endl;
-        std::cout << "[INFO] DNS refresh: " << g_config.dns_refresh_interval << "s" << std::endl;
-        std::cout << "[INFO] Log file: " << g_config.abs_log_file << std::endl;
+        std::cout << "[INFO] Daemon mode\n";
+        std::cout << "[INFO] " << g_config.forwards.size() << " forward rules\n";
+        std::cout << "[INFO] Log: " << g_config.abs_log_file << "\n";
+        std::cout << "[INFO] PID: " << g_config.abs_pid_file << "\n";
 
         if (!daemonize())
         {
-            std::cerr << "[ERROR] Failed to daemonize" << std::endl;
+            std::cerr << "[ERROR] daemonize() failed\n";
             return 1;
         }
 
-        // Initialize logger (no console in daemon mode)
-        Logger::instance().init(
-            g_config.abs_log_file,
-            g_config.log_to_file,
-            false,
-            g_config.get_log_level());
-
+        Logger::instance().init(g_config.abs_log_file, g_config.log_to_file, false, g_config.get_log_level());
         write_pid_file(g_config.abs_pid_file);
 
-        Logger::info("================================================");
-        Logger::info("IP Forward v" VERSION " daemon started (PID: " + std::to_string(getpid()) + ")");
-        Logger::info("================================================");
+        Logger::info("========================================");
+        Logger::info("IP Forward v" VERSION " started (PID: " + std::to_string(getpid()) + ")");
+        Logger::info(std::to_string(g_config.forwards.size()) + " forward rules");
+        Logger::info("========================================");
     }
     else
     {
         g_config.print();
-
-        std::cout << "| Current IP:   " << g_dns_resolver.get_current_ip() << "\n";
-        if (g_dns_resolver.is_domain())
-        {
-            std::cout << "| DNS Refresh:  Every " << g_config.dns_refresh_interval << " seconds\n";
-        }
-        std::cout << "+--------------------------------------------------+\n";
-
-        Logger::instance().init(
-            g_config.abs_log_file,
-            g_config.log_to_file,
-            g_config.log_to_console,
-            g_config.get_log_level());
+        Logger::instance().init(g_config.abs_log_file, g_config.log_to_file,
+                                g_config.log_to_console, g_config.get_log_level());
     }
 
-    // Signal handlers
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     signal(SIGPIPE, SIG_IGN);
     signal(SIGHUP, signal_handler);
 
-    // Start DNS resolver background thread
-    g_dns_resolver.start();
-
-    // Start forwarders
-    std::unique_ptr<UdpForwarder> udp_forwarder;
-    std::unique_ptr<TcpForwarder> tcp_forwarder;
-
-    if (g_config.enable_udp)
+    ForwardManager mgr;
+    if (!mgr.start())
     {
-        udp_forwarder = std::make_unique<UdpForwarder>();
-        if (!udp_forwarder->start())
-        {
-            Logger::error("UDP forwarder failed to start!");
-            remove_pid_file(g_config.abs_pid_file);
-            return 1;
-        }
+        Logger::error("Failed to start");
+        remove_pid_file(g_config.abs_pid_file);
+        return 1;
     }
 
-    if (g_config.enable_tcp)
-    {
-        tcp_forwarder = std::make_unique<TcpForwarder>();
-        if (!tcp_forwarder->start())
-        {
-            Logger::error("TCP forwarder failed to start!");
-            remove_pid_file(g_config.abs_pid_file);
-            return 1;
-        }
-    }
+    std::thread monitor(status_monitor, std::ref(mgr));
 
-    // Start monitor thread
-    std::thread monitor_thread(status_monitor);
+    Logger::info("All forwards started");
 
-    Logger::info("Service started successfully");
-    Logger::info("Forwarding: " + g_config.listen_host + ":" +
-                 std::to_string(g_config.listen_port) + " -> " +
-                 g_config.target_host + " (" + g_dns_resolver.get_current_ip() + "):" +
-                 std::to_string(g_config.target_port));
-
-    // Main loop
     while (g_running)
-    {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
 
     Logger::info("Shutting down...");
+    mgr.stop();
+    if (monitor.joinable())
+        monitor.join();
 
-    // Stop everything
-    g_dns_resolver.stop();
-    if (udp_forwarder)
-        udp_forwarder->stop();
-    if (tcp_forwarder)
-        tcp_forwarder->stop();
-
-    if (monitor_thread.joinable())
-    {
-        monitor_thread.join();
-    }
-
-    // Final stats
-    Logger::info("=== Final Statistics ===");
-    Logger::info("Packets: " + std::to_string(g_packets_in.load()) + " in / " +
-                 std::to_string(g_packets_out.load()) + " out");
-    Logger::info("Bytes: " + format_bytes(g_bytes_in.load()) + " in / " +
-                 format_bytes(g_bytes_out.load()) + " out");
-
+    Logger::info("=== Final Stats ===");
+    Logger::info("Packets: " + std::to_string(g_total_packets_in.load()) + " in / " +
+                 std::to_string(g_total_packets_out.load()) + " out");
+    Logger::info("Bytes: " + format_bytes(g_total_bytes_in.load()) + " in / " +
+                 format_bytes(g_total_bytes_out.load()) + " out");
     Logger::info("Goodbye!");
-    Logger::instance().close();
 
+    Logger::instance().close();
     remove_pid_file(g_config.abs_pid_file);
 
     return 0;
