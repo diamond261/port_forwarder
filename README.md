@@ -7,13 +7,13 @@ A fastest MCBE server forwarder.
 - Run normally
 
 ```bash
-  ./ip_forward
+./ip_forward
 ```
 
 - Run with config file
 
 ```bash
-  ./ip_forward -c /path/to/config.json
+./ip_forward -c /path/to/config.json
 ```
 
 - Run as daemon (background)
